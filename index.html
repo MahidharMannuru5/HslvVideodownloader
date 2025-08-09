@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>HLS Capture (Client-side)</title>
+<title>HLS Recorder (WebM, auto-save)</title>
 <style>
   :root { color-scheme: light dark; }
   body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0; padding:20px; }
@@ -22,24 +22,28 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Record HLS from “now” (HTML + JS)</h1>
+  <h1>Record HLS from “now” (WebM, auto-save)</h1>
+
   <div class="row">
     <input id="m3u8" type="url" placeholder="Paste your .m3u8 URL" />
-    <label><input id="useCreds" type="checkbox" /> Use credentials (cookies)</label>
     <button id="play" class="primary">Play</button>
+  </div>
+
+  <div class="row">
+    <label><input id="optAutoStart" type="checkbox" checked /> Auto-start recording after Play</label>
+    <label><input id="optAutoEnd" type="checkbox" checked /> Auto-stop & save when stream ends</label>
+  </div>
+  <div class="row">
+    <label><input id="optAutoLeave" type="checkbox" checked /> Auto-save on background/leave (best-effort)</label>
+    <label><input id="optContSave" type="checkbox" /> Continuous save to file (Chrome/Edge/Android)</label>
   </div>
 
   <video id="video" controls playsinline></video>
 
   <div class="row">
-    <button id="startCap" class="primary">Start capture (MP4, no re-encode)</button>
-    <button id="stopCap" class="ghost" disabled>Stop & Save (MP4)</button>
-    <span id="status" class="pill">idle</span>
-  </div>
-
-  <div class="row">
-    <button id="startMR" class="ghost">Fallback: Start MediaRecorder (WebM)</button>
+    <button id="startMR" class="primary">Start Recording (WebM)</button>
     <button id="stopMR" class="ghost" disabled>Stop & Save (WebM)</button>
+    <span id="status" class="pill">idle</span>
   </div>
 
   <details>
@@ -48,42 +52,45 @@
   </details>
 
   <p class="muted">
-    Works on Android/desktop Chrome, Edge, Firefox. Safari/iOS plays HLS natively (no segment access), so MP4 capture won’t work there.
-    If you see “no data yet — check CORS”, the stream host must enable CORS or you must use a server-side proxy. GitHub Pages can’t run Python; it’s static only.
+    Works on Android/desktop Chrome, Edge, Firefox. iOS Safari can play HLS but cannot be recorded with MediaRecorder.
+    GitHub Pages is static (no Python). If you ever need MP4/no-encode capture, you’d need a small server.
   </p>
 </div>
 
+<!-- hls.js for playback only -->
 <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/mux.js@6.3.0/dist/mux.min.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 const video = $("#video");
 const urlInput = $("#m3u8");
-const useCredsEl = $("#useCreds");
 const playBtn = $("#play");
-const startBtn = $("#startCap");
-const stopBtn = $("#stopCap");
+const startBtn = $("#startMR");
+const stopBtn = $("#stopMR");
 const statusEl = $("#status");
-const startMR = $("#startMR");
-const stopMR = $("#stopMR");
 const logEl = $("#log");
 
-let hls = null;
-let capturing = false;
-let transmuxer = null;
-let mp4Chunks = [];
-let segCount = 0;
-let byteCount = 0;
-let firstFormat = null; // "ts" | "fmp4"
-let gotAnyPayload = false;
-let isNative = false;
+const optAutoStart = $("#optAutoStart");
+const optAutoEnd   = $("#optAutoEnd");
+const optAutoLeave = $("#optAutoLeave");
+const optContSave  = $("#optContSave");
 
+let hls = null;
+
+// MediaRecorder state
 let mr = null;
 let mrChunks = [];
+let bytes = 0;
+let mime = "video/webm";
+let recording = false;
+let autoStarted = false;
+
+// Continuous Save state (File System Access API)
+let writer = null; // FileSystemWritableFileStream
 
 function log(...args){
   const t = new Date().toISOString().slice(11,19);
-  logEl.textContent += `[${t}] ${args.join(" ")}\n`;
+  const line = `[${t}] ${args.join(" ")}\n`;
+  logEl.textContent += line;
   logEl.scrollTop = logEl.scrollHeight;
   console.log(...args);
 }
@@ -92,163 +99,168 @@ function setStatus(t){ statusEl.textContent = t; }
 function isiOS(){ return /iP(hone|ad|od)/.test(navigator.userAgent); }
 function isSafari(){ return /^((?!chrome|android).)*safari/i.test(navigator.userAgent); }
 
-function download(parts, mime, name){
-  const blob = new Blob(parts, { type: mime });
+// File download helper (for non-continuous mode)
+function downloadBlob(parts, type, name){
+  const blob = new Blob(parts, { type });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url; a.download = name;
   document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(()=>URL.revokeObjectURL(url), 10_000);
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
-function detectFormat(u8){
-  if (u8[0] === 0x47 || u8[188] === 0x47) return "ts";
-  const head = new TextDecoder().decode(u8.subarray(0, 1024));
-  if (head.includes("moof") || head.includes("ftyp") || head.includes("mdat")) return "fmp4";
-  return "unknown";
-}
-
-// Intercept loader that exposes fragment bytes
-class InterceptLoader extends Hls.DefaultConfig.loader {
-  load(context, config, callbacks) {
-    const origOnSuccess = callbacks.onSuccess;
-    callbacks.onSuccess = (response, stats, ctx, net) => {
-      try {
-        if (ctx && ctx.type === "fragment" && response && response.data) {
-          gotAnyPayload = true;
-          if (capturing) handleFragment(new Uint8Array(response.data));
-        }
-      } catch(e){ log("intercept error:", e.message || e); }
-      origOnSuccess && origOnSuccess(response, stats, ctx, net);
-    };
-    return super.load(context, config, callbacks);
-  }
-}
-
-function handleFragment(u8){
-  if (!firstFormat || firstFormat === "unknown"){
-    firstFormat = detectFormat(u8);
-    log("Detected segment format:", firstFormat);
-  }
-  if (firstFormat === "ts"){
-    try { transmuxer.push(u8); transmuxer.flush(); }
-    catch(e){ log("transmux error:", e.message || e); }
-  } else {
-    // CMAF/fMP4 — just append
-    mp4Chunks.push(u8);
-    byteCount += u8.byteLength;
-    segCount++;
-    setStatus(`capturing… ${segCount} segs, ${(byteCount/1024/1024).toFixed(2)} MB`);
-  }
-}
-
-async function corsProbe(src, creds){
-  try {
-    const r = await fetch(src, { mode:"cors", credentials: creds ? "include":"omit" });
-    log("CORS probe:", r.type, r.status);
-    if (r.type === "opaque") log("Opaque response — server likely missing Access-Control-Allow-Origin.");
-  } catch(e){ log("CORS probe error:", e.message || e); }
-}
-
-playBtn.addEventListener("click", async () => {
-  const src = urlInput.value.trim();
-  const creds = useCredsEl.checked;
-  if (!src) return alert("Paste a .m3u8 URL");
-
-  await corsProbe(src, creds);
-
-  if (hls){ hls.destroy(); hls = null; }
-  isNative = false; firstFormat = null;
-  setStatus("loading…");
-
+async function setupHlsAndPlay(src){
+  // Safari/iOS (native) can play but MediaRecorder won’t record
   if ((isiOS() && isSafari()) || (video.canPlayType("application/vnd.apple.mpegurl") && !Hls.isSupported())){
-    isNative = true;
-    setStatus("Playing natively (Safari/iOS) — capture not possible");
-    log("Native HLS path; JS cannot read segments.");
-    video.src = src; await video.play().catch(()=>{});
+    log("Native HLS path detected (Safari/iOS) — MediaRecorder not available.");
+    video.src = src;
+    await video.play().catch(()=>{});
     return;
   }
-
-  hls = new Hls({
-    enableWorker: true,
-    fetchSetup: (ctx, init) => new Request(ctx.url, {
-      ...init,
-      mode: "cors",
-      credentials: creds ? "include" : "omit"
-    }),
-    xhrSetup: (xhr) => {
-      try { xhr.responseType = "arraybuffer"; } catch {}
-      try { xhr.withCredentials = !!creds; } catch {}
-    },
-    loader: InterceptLoader
-  });
-
+  if (hls) { hls.destroy(); hls = null; }
+  hls = new Hls({ enableWorker: true });
   hls.attachMedia(video);
-  hls.on(Hls.Events.MEDIA_ATTACHED, () => { log("MEDIA_ATTACHED"); hls.loadSource(src); });
-  hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-    log("MANIFEST_PARSED variants:", (data && data.levels && data.levels.length) || 0);
-    video.play().catch(()=>{}); setStatus("playing");
+  hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(src));
+  hls.on(Hls.Events.MANIFEST_PARSED, () => {
+    video.play().catch(()=>{});
+    log("HLS manifest parsed.");
   });
-  hls.on(Hls.Events.ERROR, (_, data) => { log("hls.js error:", data?.details || data?.type || "unknown"); });
-});
-
-startBtn.addEventListener("click", () => {
-  if (!hls && !video.src) return alert("Load the stream first.");
-  if (isNative) { alert("Native HLS in this browser — cannot capture segments."); return; }
-  if (capturing) return;
-
-  mp4Chunks = []; segCount = 0; byteCount = 0; gotAnyPayload = false;
-  transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: true });
-  transmuxer.on("data", seg => {
-    if (seg.initSegment?.byteLength){ mp4Chunks.push(seg.initSegment); byteCount += seg.initSegment.byteLength; }
-    if (seg.data?.byteLength){ mp4Chunks.push(seg.data); byteCount += seg.data.byteLength; segCount++; }
-    setStatus(`capturing… ${segCount} segs, ${(byteCount/1024/1024).toFixed(2)} MB`);
-  });
-  transmuxer.on("error", e => log("transmuxer error:", e?.message || e));
-
-  capturing = true; startBtn.disabled = true; stopBtn.disabled = false; setStatus("capturing…");
-
-  setTimeout(() => {
-    if (capturing && !gotAnyPayload){
-      log("No fragment payloads yet → likely CORS (or wrong credentials).");
-      setStatus("no data yet — check CORS");
+  hls.on(Hls.Events.ERROR, (_, data) => {
+    log("hls.js error:", data?.details || data?.type || "unknown");
+    if (data?.fatal && optAutoEnd.checked) {
+      log("Fatal stream error — auto-stopping recording.");
+      safeStopRecording();
     }
-  }, 5000);
-});
+  });
+}
 
-stopBtn.addEventListener("click", () => {
-  if (!capturing) return;
-  capturing = false; startBtn.disabled = false; stopBtn.disabled = true;
-  try { transmuxer && transmuxer.flush(); } catch {}
-  if (!segCount){ setStatus("saved 0.00 MB, 0 segments"); log("Nothing captured; CORS/native path likely."); return; }
-  const total = mp4Chunks.reduce((n,u)=>n+u.byteLength,0);
-  const out = new Uint8Array(total);
-  let off=0; for (const u of mp4Chunks){ out.set(u,off); off += u.byteLength; }
-  download([out.buffer], "video/mp4", `capture-${new Date().toISOString().replace(/[:.]/g,"-")}.mp4`);
-  setStatus(`saved ${(total/1024/1024).toFixed(2)} MB, ${segCount} segments`);
-});
+async function startRecording() {
+  if (!video.captureStream) { alert("MediaRecorder not supported here."); return; }
+  if (recording) return;
 
-// MediaRecorder fallback (works regardless of CORS)
-startMR.addEventListener("click", () => {
-  if (!video.captureStream){ alert("MediaRecorder not supported here."); return; }
   const stream = video.captureStream();
-  const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9"
-            : MediaRecorder.isTypeSupported("video/webm;codecs=vp8") ? "video/webm;codecs=vp8"
-            : "video/webm";
+  mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9"
+       : MediaRecorder.isTypeSupported("video/webm;codecs=vp8") ? "video/webm;codecs=vp8"
+       : "video/webm";
+
   mrChunks = [];
+  bytes = 0;
+
+  // If user opted for continuous save, open a file once (requires user gesture)
+  if (optContSave.checked && 'showSaveFilePicker' in window) {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: `recording-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`,
+        types: [{ description: "WebM Video", accept: { "video/webm": [".webm"] } }]
+      });
+      writer = await handle.createWritable();
+      log("Continuous save enabled: writing chunks directly to file.");
+    } catch (e) {
+      log("File picker canceled or API not available:", e.message || e);
+      writer = null;
+      optContSave.checked = false;
+    }
+  } else {
+    writer = null;
+  }
+
   mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 4_000_000 });
-  mr.ondataavailable = e => { if (e.data?.size) mrChunks.push(e.data); };
-  mr.onstop = () => download(mrChunks, mime, `recording-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`);
-  mr.start(1000);
-  startMR.disabled = true; stopMR.disabled = false;
-  setStatus("recording via MediaRecorder…");
+
+  mr.ondataavailable = async (e) => {
+    if (!e.data || !e.data.size) return;
+    bytes += e.data.size;
+    if (writer) {
+      try { await writer.write(e.data); }
+      catch (err) { log("Write error:", err.message || err); }
+    } else {
+      mrChunks.push(e.data);
+    }
+    setStatus(`recording… ${(bytes/1024/1024).toFixed(2)} MB`);
+  };
+
+  mr.onstop = async () => {
+    if (writer) {
+      try { await writer.close(); log("File closed — saved to disk."); }
+      catch (e) { log("Error closing file:", e.message || e); }
+      writer = null;
+      setStatus("saved (file)");
+      return;
+    }
+    if (mrChunks.length) {
+      downloadBlob(mrChunks, mime, `recording-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`);
+      setStatus("saved (WebM)");
+    } else {
+      setStatus("nothing recorded");
+    }
+  };
+
+  mr.start(1000); // collect chunks every second
+  recording = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  setStatus("recording…");
   log("MediaRecorder started with", mime);
+}
+
+function stopRecording() {
+  if (mr && recording && mr.state !== "inactive") {
+    try { mr.stop(); } catch {}
+  }
+  recording = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+}
+
+function safeStopRecording() {
+  if (!recording) return;
+  try { mr.requestData && mr.requestData(); } catch {}
+  stopRecording();
+}
+
+// --- UI wiring ---
+playBtn.addEventListener("click", async () => {
+  const src = urlInput.value.trim();
+  if (!src) return alert("Paste a .m3u8 URL");
+  autoStarted = false;
+  await setupHlsAndPlay(src);
 });
-stopMR.addEventListener("click", () => {
-  if (mr && mr.state !== "inactive") mr.stop();
-  startMR.disabled = false; stopMR.disabled = true;
-  setStatus("saved (WebM)");
+
+// Auto-start recording when video actually starts playing
+video.addEventListener("playing", () => {
+  if (optAutoStart.checked && !autoStarted) {
+    autoStarted = true;
+    startRecording();
+  }
 });
+
+// Auto-stop & save when stream ends
+video.addEventListener("ended", () => {
+  log("Video ended.");
+  if (optAutoEnd.checked) safeStopRecording();
+});
+
+// Optional: if playback errors out
+video.addEventListener("error", () => {
+  log("Video element error.");
+  if (optAutoEnd.checked) safeStopRecording();
+});
+
+// Save when user leaves / app goes to background (best-effort)
+if (optAutoLeave) {
+  const leaveHandler = () => { if (optAutoLeave.checked) safeStopRecording(); };
+  window.addEventListener("pagehide", leaveHandler);
+  window.addEventListener("beforeunload", leaveHandler);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden" && optAutoLeave.checked) safeStopRecording();
+  });
+}
+
+startBtn.addEventListener("click", () => startRecording());
+stopBtn.addEventListener("click", () => safeStopRecording());
+
+// Helpful: allow ?u=<m3u8> to auto-load
+const qp = new URLSearchParams(location.search);
+if (qp.get("u")) { urlInput.value = qp.get("u"); playBtn.click(); }
 </script>
 </body>
 </html>
