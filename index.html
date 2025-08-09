@@ -1,356 +1,254 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HLS Capture (Client-Side)</title>
-  <style>
-    :root { color-scheme: light dark; }
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 24px; }
-    .wrap { max-width: 960px; margin: 0 auto; display: grid; gap: 16px; }
-    h1 { font-size: 1.25rem; margin: 0 0 8px; }
-    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-    input[type=url] { flex: 1 1 420px; padding: 10px; border-radius: 10px; border: 1px solid #8884; }
-    button { padding: 10px 14px; border: 0; border-radius: 12px; cursor: pointer; }
-    button.primary { background: #2563eb; color: #fff; }
-    button.ghost { background: transparent; border: 1px solid #8884; }
-    video { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 16px; }
-    .pill { padding: 6px 10px; border-radius: 999px; background: #8882; font-variant-numeric: tabular-nums; }
-    .muted { opacity: .75; }
-    #log { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #00000008; padding: 12px; border-radius: 12px; max-height: 260px; overflow: auto; }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>HLS Capture (Client-side)</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0; padding:20px; }
+  .wrap { max-width: 960px; margin: 0 auto; display: grid; gap: 14px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  input[type=url]{ flex:1 1 420px; padding:10px; border-radius:10px; border:1px solid #8884; }
+  label { display:flex; align-items:center; gap:6px; font-size:.95rem; }
+  button { padding:10px 14px; border:0; border-radius:12px; cursor:pointer; }
+  button.primary { background:#2563eb; color:#fff; }
+  button.ghost { background:transparent; border:1px solid #8884; }
+  video { width:100%; aspect-ratio:16/9; background:#000; border-radius:16px; }
+  .pill { padding:6px 10px; border-radius:999px; background:#8882; font-variant-numeric: tabular-nums; }
+  .muted { opacity:.75; }
+  #log { white-space:pre-wrap; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0000000a; padding:12px; border-radius:12px; max-height:260px; overflow:auto; }
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Record live HLS from “now” (HTML + JS)</h1>
-
-    <div class="row">
-      <input id="m3u8" type="url" placeholder="Paste your .m3u8 URL here" />
-      <button id="play" class="primary">Play</button>
-    </div>
-
-    <video id="video" controls playsinline></video>
-
-    <div class="row">
-      <button id="startCap" class="primary">Start capture (no re-encode)</button>
-      <button id="stopCap"  class="ghost" disabled>Stop & Save (MP4)</button>
-      <span id="status" class="pill">idle</span>
-    </div>
-
-    <div class="row">
-      <button id="startMR" class="ghost">Fallback: start MediaRecorder (WebM)</button>
-      <button id="stopMR"  class="ghost" disabled>Stop & Save (WebM)</button>
-    </div>
-
-    <details>
-      <summary>Diagnostics & log</summary>
-      <div id="log"></div>
-    </details>
-
-    <p class="muted">
-      Works on Android Chrome and desktop Chrome/Edge/Firefox. Safari/iOS plays HLS natively and does not expose segment bytes to JavaScript, so capture won’t work there.
-      You must paste the actual <code>.m3u8</code> URL here (recording another site’s tab is not possible).
-    </p>
+<div class="wrap">
+  <h1>Record HLS from “now” (HTML + JS)</h1>
+  <div class="row">
+    <input id="m3u8" type="url" placeholder="Paste your .m3u8 URL" />
+    <label><input id="useCreds" type="checkbox" /> Use credentials (cookies)</label>
+    <button id="play" class="primary">Play</button>
   </div>
 
-  <!-- hls.js for playback -->
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
-  <!-- mux.js for TS -> fMP4 transmux (when needed) -->
-  <script src="https://cdn.jsdelivr.net/npm/mux.js@6.3.0/dist/mux.min.js"></script>
+  <video id="video" controls playsinline></video>
 
-  <script>
-    const $ = (s) => document.querySelector(s);
-    const video     = $("#video");
-    const playBtn   = $("#play");
-    const startBtn  = $("#startCap");
-    const stopBtn   = $("#stopCap");
-    const statusEl  = $("#status");
-    const urlInput  = $("#m3u8");
-    const logEl     = $("#log");
-    const startMR   = $("#startMR");
-    const stopMR    = $("#stopMR");
+  <div class="row">
+    <button id="startCap" class="primary">Start capture (MP4, no re-encode)</button>
+    <button id="stopCap" class="ghost" disabled>Stop & Save (MP4)</button>
+    <span id="status" class="pill">idle</span>
+  </div>
 
-    let hls = null;
-    let capturing = false;
+  <div class="row">
+    <button id="startMR" class="ghost">Fallback: Start MediaRecorder (WebM)</button>
+    <button id="stopMR" class="ghost" disabled>Stop & Save (WebM)</button>
+  </div>
 
-    // For TS -> MP4 path (mux.js)
-    let transmuxer = null;
-    let useTransmux = true;          // switches to "as-is fMP4 assembly" if we detect CMAF
-    let mp4Chunks = [];              // Uint8Array pieces to concat
-    let segCount = 0;
-    let byteCount = 0;
-    let firstFormat = null;          // "ts" | "fmp4"
-    let gotAnyPayload = false;
-    let isNative = false;
+  <details>
+    <summary>Diagnostics & log</summary>
+    <div id="log"></div>
+  </details>
 
-    // MediaRecorder fallback
-    let mr = null;
-    let mrChunks = [];
+  <p class="muted">
+    Works on Android/desktop Chrome, Edge, Firefox. Safari/iOS plays HLS natively (no segment access), so MP4 capture won’t work there.
+    If you see “no data yet — check CORS”, the stream host must enable CORS or you must use a server-side proxy. GitHub Pages can’t run Python; it’s static only.
+  </p>
+</div>
 
-    function log(...args) {
-      const t = new Date().toISOString().slice(11, 19);
-      logEl.textContent += `[${t}] ${args.join(" ")}\n`;
-      logEl.scrollTop = logEl.scrollHeight;
-      console.log(...args);
-    }
-    function setStatus(t){ statusEl.textContent = t; }
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mux.js@6.3.0/dist/mux.min.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const video = $("#video");
+const urlInput = $("#m3u8");
+const useCredsEl = $("#useCreds");
+const playBtn = $("#play");
+const startBtn = $("#startCap");
+const stopBtn = $("#stopCap");
+const statusEl = $("#status");
+const startMR = $("#startMR");
+const stopMR = $("#stopMR");
+const logEl = $("#log");
 
-    function isiOS() { return /iP(hone|ad|od)/.test(navigator.userAgent); }
-    function isSafari() {
-      const ua = navigator.userAgent;
-      return /^((?!chrome|android).)*safari/i.test(ua);
-    }
+let hls = null;
+let capturing = false;
+let transmuxer = null;
+let mp4Chunks = [];
+let segCount = 0;
+let byteCount = 0;
+let firstFormat = null; // "ts" | "fmp4"
+let gotAnyPayload = false;
+let isNative = false;
 
-    // Utility: file download
-    function downloadBlob(parts, mime, filename) {
-      const blob = new Blob(parts, { type: mime });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url; a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 10_000);
-    }
+let mr = null;
+let mrChunks = [];
 
-    // Heuristics to detect segment format
-    function detectFormat(u8) {
-      // TS starts with 0x47 every 188 bytes; first byte often 0x47
-      if (u8[0] === 0x47 || u8[188] === 0x47) return "ts";
-      // fMP4 should contain 'moof'/'mdat' boxes etc. Quick check for 'moof' in first KB
-      const ascii = new TextDecoder().decode(u8.subarray(0, 1024));
-      if (ascii.includes("moof") || ascii.includes("ftyp") || ascii.includes("mdat")) return "fmp4";
-      return "unknown";
-    }
+function log(...args){
+  const t = new Date().toISOString().slice(11,19);
+  logEl.textContent += `[${t}] ${args.join(" ")}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+  console.log(...args);
+}
+function setStatus(t){ statusEl.textContent = t; }
 
-    // Assemble and save buffered chunks
-    function saveAsMp4() {
-      // Concatenate all Uint8Arrays
-      const total = mp4Chunks.reduce((n, u) => n + u.byteLength, 0);
-      const out = new Uint8Array(total);
-      let off = 0; for (const u of mp4Chunks) { out.set(u, off); off += u.byteLength; }
+function isiOS(){ return /iP(hone|ad|od)/.test(navigator.userAgent); }
+function isSafari(){ return /^((?!chrome|android).)*safari/i.test(navigator.userAgent); }
 
-      // If we transmuxed TS -> MP4, mime is video/mp4. If we captured CMAF fMP4 "as is",
-      // the container is already MP4 fragments; most players can play concatenated fMP4 too.
-      const mime = "video/mp4";
-      const name = `capture-${new Date().toISOString().replace(/[:.]/g, "-")}.mp4`;
-      downloadBlob([out.buffer], mime, name);
-      setStatus(`saved ${(total/1024/1024).toFixed(2)} MB, ${segCount} segments`);
-      log("Saved", (total/1024/1024).toFixed(2), "MB,", segCount, "segments. Format:", firstFormat || "n/a");
-    }
+function download(parts, mime, name){
+  const blob = new Blob(parts, { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 10_000);
+}
 
-    // Custom loader to intercept fragment bytes (works for both XHR and Fetch loaders)
-    class InterceptLoader extends Hls.DefaultConfig.loader {
-      constructor(config) {
-        super(config);
-        this._onSuccess = null; // keep ref for wrapping
-      }
-      load(context, config, callbacks) {
-        const origOnSuccess = callbacks.onSuccess;
-        callbacks.onSuccess = (response, stats, ctx, net) => {
-          try {
-            if (ctx && ctx.type === "fragment" && response && response.data) {
-              // response.data is ArrayBuffer
-              gotAnyPayload = true;
-              if (capturing) handleRawFragment(new Uint8Array(response.data), ctx);
-            }
-          } catch (e) {
-            log("intercept error:", e.message || e);
-          }
-          origOnSuccess && origOnSuccess(response, stats, ctx, net);
-        };
-        return super.load(context, config, callbacks);
-      }
-    }
+function detectFormat(u8){
+  if (u8[0] === 0x47 || u8[188] === 0x47) return "ts";
+  const head = new TextDecoder().decode(u8.subarray(0, 1024));
+  if (head.includes("moof") || head.includes("ftyp") || head.includes("mdat")) return "fmp4";
+  return "unknown";
+}
 
-    function handleRawFragment(u8 /* Uint8Array */, ctx) {
-      if (!firstFormat || firstFormat === "unknown") {
-        firstFormat = detectFormat(u8);
-        if (firstFormat === "fmp4") {
-          // Switch off transmux — we’ll assemble as-is
-          useTransmux = false;
-          log("Detected CMAF/fMP4 segments — assembling without transmux.");
-        } else if (firstFormat === "ts") {
-          useTransmux = true;
-          log("Detected MPEG-TS segments — using transmux (mux.js).");
-        } else {
-          log("Unknown segment format; attempting transmux anyway.");
-        }
-      }
-
-      if (useTransmux) {
-        // Feed TS into transmuxer to get MP4 fragments
-        try {
-          transmuxer.push(u8);
-          transmuxer.flush();
-        } catch (e) {
-          log("transmux error:", e.message || e);
-        }
-      } else {
-        // fMP4 path: just store as-is
-        mp4Chunks.push(u8);
-        byteCount += u8.byteLength;
-        segCount++;
-        setStatus(`capturing… ${segCount} segs, ${(byteCount/1024/1024).toFixed(2)} MB`);
-      }
-    }
-
-    // Init / play
-    playBtn.addEventListener("click", async () => {
-      const src = urlInput.value.trim();
-      if (!src) return alert("Paste a .m3u8 URL");
-
-      // Basic CORS probe (playlist only). If this fails with opaque/no-cors, segment capture will fail.
+// Intercept loader that exposes fragment bytes
+class InterceptLoader extends Hls.DefaultConfig.loader {
+  load(context, config, callbacks) {
+    const origOnSuccess = callbacks.onSuccess;
+    callbacks.onSuccess = (response, stats, ctx, net) => {
       try {
-        const r = await fetch(src, { mode: "cors", credentials: "omit" });
-        log("CORS probe:", r.type, r.status);
-        if (r.type === "opaque") log("Warning: opaque response — server likely missing Access-Control-Allow-Origin.");
-      } catch (e) {
-        log("CORS probe error:", e.message || e);
-      }
-
-      // Reset previous
-      if (hls) { hls.destroy(); hls = null; }
-      isNative = false;
-      setStatus("loading…");
-      firstFormat = null;
-      useTransmux = true;
-
-      // Native HLS path (Safari/iOS) — cannot capture
-      if ((isiOS() && isSafari()) || (video.canPlayType("application/vnd.apple.mpegurl") && !Hls.isSupported())) {
-        isNative = true;
-        setStatus("Playing natively (Safari/iOS) — capture not possible");
-        log("Native HLS path detected. Capture not available in this browser.");
-        video.src = src;
-        await video.play().catch(()=>{});
-        return;
-      }
-
-      // hls.js (MSE) path
-      hls = new Hls({
-        enableWorker: true,
-        // Force CORS + ArrayBuffer visibility in fetch loader
-        fetchSetup: (context, initParams) => {
-          return new Request(context.url, {
-            ...initParams,
-            mode: "cors",
-            credentials: "omit"
-          });
-        },
-        xhrSetup: (xhr) => {
-          try { xhr.responseType = "arraybuffer"; } catch {}
-        },
-        loader: InterceptLoader
-      });
-
-      hls.attachMedia(video);
-      hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-        log("MEDIA_ATTACHED");
-        hls.loadSource(src);
-      });
-      hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
-        log("MANIFEST_PARSED variants:", data && data.levels && data.levels.length || 0);
-        video.play().catch(()=>{});
-        setStatus("playing");
-      });
-      hls.on(Hls.Events.ERROR, (_, data) => {
-        log("hls.js error:", data?.details || data?.type || "unknown");
-      });
-    });
-
-    // Start capture
-    startBtn.addEventListener("click", () => {
-      if (!hls && !video.src) return alert("Load the stream first.");
-      if (isNative) {
-        alert("This browser is using native HLS. Segment capture isn’t possible here.");
-        return;
-      }
-      if (capturing) return;
-
-      // Reset buffers
-      mp4Chunks = [];
-      segCount = 0;
-      byteCount = 0;
-      gotAnyPayload = false;
-
-      // Transmuxer for TS -> MP4 (no re-encode)
-      transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: true });
-      transmuxer.on("data", (segment) => {
-        if (segment.initSegment && segment.initSegment.byteLength) {
-          mp4Chunks.push(segment.initSegment);
-          byteCount += segment.initSegment.byteLength;
+        if (ctx && ctx.type === "fragment" && response && response.data) {
+          gotAnyPayload = true;
+          if (capturing) handleFragment(new Uint8Array(response.data));
         }
-        if (segment.data && segment.data.byteLength) {
-          mp4Chunks.push(segment.data);
-          byteCount += segment.data.byteLength;
-          segCount++;
-          setStatus(`capturing… ${segCount} segs, ${(byteCount/1024/1024).toFixed(2)} MB`);
-        }
-      });
-      transmuxer.on("error", (e) => log("transmuxer error:", e?.message || e));
+      } catch(e){ log("intercept error:", e.message || e); }
+      origOnSuccess && origOnSuccess(response, stats, ctx, net);
+    };
+    return super.load(context, config, callbacks);
+  }
+}
 
-      capturing = true;
-      startBtn.disabled = true;
-      stopBtn.disabled = false;
-      setStatus("capturing…");
+function handleFragment(u8){
+  if (!firstFormat || firstFormat === "unknown"){
+    firstFormat = detectFormat(u8);
+    log("Detected segment format:", firstFormat);
+  }
+  if (firstFormat === "ts"){
+    try { transmuxer.push(u8); transmuxer.flush(); }
+    catch(e){ log("transmux error:", e.message || e); }
+  } else {
+    // CMAF/fMP4 — just append
+    mp4Chunks.push(u8);
+    byteCount += u8.byteLength;
+    segCount++;
+    setStatus(`capturing… ${segCount} segs, ${(byteCount/1024/1024).toFixed(2)} MB`);
+  }
+}
 
-      // If after 5s we still haven’t seen any payloads, it’s likely CORS
-      setTimeout(() => {
-        if (capturing && !gotAnyPayload) {
-          log("No fragment payloads received yet. Likely CORS (server not allowing Access-Control-Allow-Origin).");
-          setStatus("no data yet — check CORS");
-        }
-      }, 5000);
-    });
+async function corsProbe(src, creds){
+  try {
+    const r = await fetch(src, { mode:"cors", credentials: creds ? "include":"omit" });
+    log("CORS probe:", r.type, r.status);
+    if (r.type === "opaque") log("Opaque response — server likely missing Access-Control-Allow-Origin.");
+  } catch(e){ log("CORS probe error:", e.message || e); }
+}
 
-    // Stop & Save
-    stopBtn.addEventListener("click", () => {
-      if (!capturing) return;
-      capturing = false;
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
-      try { transmuxer && transmuxer.flush(); } catch {}
+playBtn.addEventListener("click", async () => {
+  const src = urlInput.value.trim();
+  const creds = useCredsEl.checked;
+  if (!src) return alert("Paste a .m3u8 URL");
 
-      if (!segCount) {
-        setStatus("saved 0.00 MB, 0 segments");
-        log("Nothing captured. Causes: native HLS (iOS/Safari), CORS blocked, or wrong URL.");
-        return;
-      }
-      saveAsMp4();
-    });
+  await corsProbe(src, creds);
 
-    // --- MediaRecorder fallback (re-encodes the *played* video to WebM) ---
-    startMR.addEventListener("click", async () => {
-      try {
-        if (!video.captureStream) {
-          alert("MediaRecorder not supported in this browser.");
-          return;
-        }
-        const stream = video.captureStream();
-        const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9"
-                    : MediaRecorder.isTypeSupported("video/webm;codecs=vp8") ? "video/webm;codecs=vp8"
-                    : "video/webm";
-        mrChunks = [];
-        mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 4_000_000 });
-        mr.ondataavailable = e => { if (e.data && e.data.size) mrChunks.push(e.data); };
-        mr.onstop = () => {
-          downloadBlob(mrChunks, mime, `recording-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`);
-          setStatus("saved (WebM)");
-        };
-        mr.start(1000);
-        startMR.disabled = true; stopMR.disabled = false;
-        setStatus("recording via MediaRecorder…");
-        log("MediaRecorder started with", mime);
-      } catch (e) {
-        log("MediaRecorder error:", e?.message || e);
-        alert("MediaRecorder failed to start.");
-      }
-    });
+  if (hls){ hls.destroy(); hls = null; }
+  isNative = false; firstFormat = null;
+  setStatus("loading…");
 
-    stopMR.addEventListener("click", () => {
-      if (mr && mr.state !== "inactive") mr.stop();
-      startMR.disabled = false; stopMR.disabled = true;
-    });
-  </script>
+  if ((isiOS() && isSafari()) || (video.canPlayType("application/vnd.apple.mpegurl") && !Hls.isSupported())){
+    isNative = true;
+    setStatus("Playing natively (Safari/iOS) — capture not possible");
+    log("Native HLS path; JS cannot read segments.");
+    video.src = src; await video.play().catch(()=>{});
+    return;
+  }
+
+  hls = new Hls({
+    enableWorker: true,
+    fetchSetup: (ctx, init) => new Request(ctx.url, {
+      ...init,
+      mode: "cors",
+      credentials: creds ? "include" : "omit"
+    }),
+    xhrSetup: (xhr) => {
+      try { xhr.responseType = "arraybuffer"; } catch {}
+      try { xhr.withCredentials = !!creds; } catch {}
+    },
+    loader: InterceptLoader
+  });
+
+  hls.attachMedia(video);
+  hls.on(Hls.Events.MEDIA_ATTACHED, () => { log("MEDIA_ATTACHED"); hls.loadSource(src); });
+  hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+    log("MANIFEST_PARSED variants:", (data && data.levels && data.levels.length) || 0);
+    video.play().catch(()=>{}); setStatus("playing");
+  });
+  hls.on(Hls.Events.ERROR, (_, data) => { log("hls.js error:", data?.details || data?.type || "unknown"); });
+});
+
+startBtn.addEventListener("click", () => {
+  if (!hls && !video.src) return alert("Load the stream first.");
+  if (isNative) { alert("Native HLS in this browser — cannot capture segments."); return; }
+  if (capturing) return;
+
+  mp4Chunks = []; segCount = 0; byteCount = 0; gotAnyPayload = false;
+  transmuxer = new muxjs.mp4.Transmuxer({ keepOriginalTimestamps: true });
+  transmuxer.on("data", seg => {
+    if (seg.initSegment?.byteLength){ mp4Chunks.push(seg.initSegment); byteCount += seg.initSegment.byteLength; }
+    if (seg.data?.byteLength){ mp4Chunks.push(seg.data); byteCount += seg.data.byteLength; segCount++; }
+    setStatus(`capturing… ${segCount} segs, ${(byteCount/1024/1024).toFixed(2)} MB`);
+  });
+  transmuxer.on("error", e => log("transmuxer error:", e?.message || e));
+
+  capturing = true; startBtn.disabled = true; stopBtn.disabled = false; setStatus("capturing…");
+
+  setTimeout(() => {
+    if (capturing && !gotAnyPayload){
+      log("No fragment payloads yet → likely CORS (or wrong credentials).");
+      setStatus("no data yet — check CORS");
+    }
+  }, 5000);
+});
+
+stopBtn.addEventListener("click", () => {
+  if (!capturing) return;
+  capturing = false; startBtn.disabled = false; stopBtn.disabled = true;
+  try { transmuxer && transmuxer.flush(); } catch {}
+  if (!segCount){ setStatus("saved 0.00 MB, 0 segments"); log("Nothing captured; CORS/native path likely."); return; }
+  const total = mp4Chunks.reduce((n,u)=>n+u.byteLength,0);
+  const out = new Uint8Array(total);
+  let off=0; for (const u of mp4Chunks){ out.set(u,off); off += u.byteLength; }
+  download([out.buffer], "video/mp4", `capture-${new Date().toISOString().replace(/[:.]/g,"-")}.mp4`);
+  setStatus(`saved ${(total/1024/1024).toFixed(2)} MB, ${segCount} segments`);
+});
+
+// MediaRecorder fallback (works regardless of CORS)
+startMR.addEventListener("click", () => {
+  if (!video.captureStream){ alert("MediaRecorder not supported here."); return; }
+  const stream = video.captureStream();
+  const mime = MediaRecorder.isTypeSupported("video/webm;codecs=vp9") ? "video/webm;codecs=vp9"
+            : MediaRecorder.isTypeSupported("video/webm;codecs=vp8") ? "video/webm;codecs=vp8"
+            : "video/webm";
+  mrChunks = [];
+  mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 4_000_000 });
+  mr.ondataavailable = e => { if (e.data?.size) mrChunks.push(e.data); };
+  mr.onstop = () => download(mrChunks, mime, `recording-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`);
+  mr.start(1000);
+  startMR.disabled = true; stopMR.disabled = false;
+  setStatus("recording via MediaRecorder…");
+  log("MediaRecorder started with", mime);
+});
+stopMR.addEventListener("click", () => {
+  if (mr && mr.state !== "inactive") mr.stop();
+  startMR.disabled = false; stopMR.disabled = true;
+  setStatus("saved (WebM)");
+});
+</script>
 </body>
 </html>
