@@ -1,272 +1,124 @@
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>HLS Recorder → WebM (VP8) + Optional MP4</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0; padding:20px; }
-  .wrap { max-width: 960px; margin: 0 auto; display: grid; gap: 14px; }
-  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  input[type=url]{ flex:1 1 420px; padding:10px; border-radius:10px; border:1px solid #8884; }
-  label { display:flex; align-items:center; gap:6px; font-size:.95rem; }
-  button { padding:10px 14px; border:0; border-radius:12px; cursor:pointer; }
-  button.primary { background:#2563eb; color:#fff; }
-  button.ghost { background:transparent; border:1px solid #8884; }
-  video { width:100%; aspect-ratio:16/9; background:#000; border-radius:16px; }
-  .pill { padding:6px 10px; border-radius:999px; background:#8882; font-variant-numeric: tabular-nums; }
-  .muted { opacity:.75; }
-  #log { white-space:pre-wrap; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0000000a; padding:12px; border-radius:12px; max-height:260px; overflow:auto; }
-  progress { width: 250px; height: 12px; }
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HLS Player with Cookie Auth</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0; padding:20px; }
+    .wrap { max-width: 920px; margin: 0 auto; display: grid; gap: 14px; }
+    .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    input[type=url], input[type=text] { flex: 1 1 380px; padding:10px; border-radius:10px; border:1px solid #8884; }
+    label { font-size:.95rem; }
+    button { padding:10px 14px; border:0; border-radius:12px; cursor:pointer; }
+    button.primary { background:#2563eb; color:#fff; }
+    button.ghost { background:transparent; border:1px solid #8884; }
+    video { width:100%; aspect-ratio:16/9; background:#000; border-radius:16px; }
+    .muted { opacity:.75; }
+    #log { white-space:pre-wrap; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background:#0000000a; padding:12px; border-radius:12px; max-height:240px; overflow:auto; }
+  </style>
 </head>
 <body>
-<div class="wrap">
-  <h1>Record HLS from “now” → WebM (VP8) • Convert to MP4 (optional)</h1>
+  <div class="wrap">
+    <h1>HLS Player (sends your cookie)</h1>
 
-  <div class="row">
-    <input id="m3u8" type="url" placeholder="Paste your .m3u8 URL" />
-    <button id="play" class="primary">Play</button>
+    <div class="row">
+      <input id="m3u8" type="url" placeholder="Paste your .m3u8 URL" />
+      <button id="play" class="primary">Play</button>
+    </div>
+
+    <div class="row">
+      <input id="cookieName"  type="text" placeholder="Cookie name (e.g., sessionid)" />
+      <input id="cookieValue" type="text" placeholder="Cookie value" />
+      <button id="setCookie" class="ghost">Set Cookie</button>
+      <span class="muted">Cookie set for <span id="cookieScope"></span>. hls.js will send credentials.</span>
+    </div>
+
+    <video id="video" controls playsinline></video>
+
+    <details>
+      <summary>Diagnostics</summary>
+      <div id="log"></div>
+    </details>
   </div>
 
-  <div class="row">
-    <label><input id="optAutoStart" type="checkbox" checked /> Auto-start recording after Play</label>
-    <label><input id="optAutoEnd" type="checkbox" checked /> Auto-stop & save when stream ends</label>
-    <label><input id="optAutoLeave" type="checkbox" checked /> Auto-save on background/leave</label>
-    <label><input id="optContSave" type="checkbox" /> Continuous save to file (Chrome/Edge/Android)</label>
-  </div>
+  <!-- hls.js for playback -->
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
 
-  <video id="video" controls playsinline></video>
+  <script>
+  const $ = s => document.querySelector(s);
+  const video = $("#video");
+  const urlInput = $("#m3u8");
+  const playBtn  = $("#play");
+  const setBtn   = $("#setCookie");
+  const nameEl   = $("#cookieName");
+  const valueEl  = $("#cookieValue");
+  const scopeEl  = $("#cookieScope");
+  const logEl    = $("#log");
 
-  <div class="row">
-    <button id="startMR" class="primary">Start Recording (WebM)</button>
-    <button id="stopMR" class="ghost" disabled>Stop & Save (WebM)</button>
-    <span id="status" class="pill">idle</span>
-  </div>
+  let hls = null;
 
-  <div class="row">
-    <button id="convertMp4" class="ghost" disabled>Convert saved WebM → MP4</button>
-    <progress id="ffxProgress" value="0" max="100" hidden></progress>
-    <span id="ffxNote" class="muted"></span>
-  </div>
+  function log(...a){ const t=new Date().toISOString().slice(11,19); logEl.textContent += `[${t}] ${a.join(' ')}\n`; logEl.scrollTop = logEl.scrollHeight; console.log(...a); }
 
-  <details>
-    <summary>Diagnostics & log</summary>
-    <div id="log"></div>
-  </details>
-
-  <p class="muted">
-    If your saved WebM shows 0.00 duration: don’t leave the page before we finish stopping/closing; use “Continuous save” for safer writes; and prefer VP8 (already set).
-    MP4 conversion uses ffmpeg.wasm (CPU-intensive). Keep the page in foreground; large videos can take a while on phones.
-  </p>
-</div>
-
-<!-- hls.js for playback only -->
-<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
-<!-- ffmpeg.wasm (main and core) -->
-<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.6/dist/ffmpeg.min.js"></script>
-<script src="https://unpkg.com/@ffmpeg/util@0.12.2/dist/index.min.js"></script>
-
-<script>
-const $ = s => document.querySelector(s);
-const video = $("#video");
-const urlInput = $("#m3u8");
-const playBtn = $("#play");
-const startBtn = $("#startMR");
-const stopBtn = $("#stopMR");
-const statusEl = $("#status");
-const logEl = $("#log");
-const optAutoStart = $("#optAutoStart");
-const optAutoEnd   = $("#optAutoEnd");
-const optAutoLeave = $("#optAutoLeave");
-const optContSave  = $("#optContSave");
-const convertBtn   = $("#convertMp4");
-const ffxProgress  = $("#ffxProgress");
-const ffxNote      = $("#ffxNote");
-
-let hls = null;
-
-// MediaRecorder state
-let mr = null, mrChunks = [], bytes = 0, mime = "video/webm;codecs=vp8", recording = false, autoStarted = false;
-let writer = null; // FileSystemWritableFileStream (continuous save)
-let lastSavedWebMBlob = null; // we keep this for MP4 conversion
-
-function log(...args){ const t = new Date().toISOString().slice(11,19); logEl.textContent += `[${t}] ${args.join(" ")}\n`; logEl.scrollTop = logEl.scrollHeight; console.log(...args); }
-function setStatus(t){ statusEl.textContent = t; }
-
-function isiOS(){ return /iP(hone|ad|od)/.test(navigator.userAgent); }
-function isSafari(){ return /^((?!chrome|android).)*safari/i.test(navigator.userAgent); }
-
-function downloadBlob(blob, name){
-  const url = URL.createObjectURL(blob);
-  const a = Object.assign(document.createElement("a"), { href: url, download: name });
-  document.body.appendChild(a); a.click(); a.remove();
-  setTimeout(()=>URL.revokeObjectURL(url), 10_000);
-}
-
-async function setupHlsAndPlay(src){
-  if ((isiOS() && isSafari()) || (video.canPlayType("application/vnd.apple.mpegurl") && !Hls.isSupported())){
-    log("Native HLS path (Safari/iOS) — MediaRecorder not available.");
-    video.src = src; await video.play().catch(()=>{});
-    return;
-  }
-  if (hls) { hls.destroy(); hls = null; }
-  hls = new Hls({ enableWorker: true });
-  hls.attachMedia(video);
-  hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(src));
-  hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(()=>{}); log("HLS manifest parsed."); });
-  hls.on(Hls.Events.ERROR, (_, data) => {
-    log("hls.js error:", data?.details || data?.type || "unknown");
-    if (data?.fatal && optAutoEnd.checked) { log("Fatal stream error — auto-stopping."); safeStopRecording(); }
-  });
-}
-
-async function startRecording() {
-  if (!video.captureStream) { alert("MediaRecorder not supported here."); return; }
-  if (recording) return;
-
-  const stream = video.captureStream();
-  if (!MediaRecorder.isTypeSupported(mime)) {
-    // fallback to generic WebM if vp8 string not accepted
-    mime = MediaRecorder.isTypeSupported("video/webm") ? "video/webm" : "";
+  // --- Cookie: set for current origin (domain/path handled by browser) ---
+  function setSiteCookie(name, value){
+    // NOTE: You can only set cookies for the current site. If the HLS URL is on a different domain,
+    // run through a same-origin proxy so the cookie applies.
+    if (!name || !value) { alert('Cookie name and value are required'); return; }
+    const secure = (location.protocol === 'https:');
+    // Lax works for same-site. If you are truly cross-site via a proxy, this still works since requests are same-origin.
+    document.cookie = `${encodeURIComponent(name)}=${encodeURIComponent(value)}; Path=/; ${secure ? 'Secure; ' : ''}SameSite=Lax`;
+    scopeEl.textContent = location.host;
+    log('Cookie set for', location.host);
   }
 
-  mrChunks = []; bytes = 0; lastSavedWebMBlob = null;
+  setBtn.addEventListener('click', () => setSiteCookie(nameEl.value.trim(), valueEl.value.trim()));
 
-  if (optContSave.checked && 'showSaveFilePicker' in window) {
-    try {
-      const handle = await window.showSaveFilePicker({
-        suggestedName: `recording-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`,
-        types: [{ description: "WebM Video", accept: { "video/webm": [".webm"] } }]
-      });
-      writer = await handle.createWritable();
-      log("Continuous save: writing chunks directly to file.");
-    } catch (e) {
-      log("File picker canceled / unavailable:", e.message || e);
-      writer = null; optContSave.checked = false;
-    }
-  } else { writer = null; }
+  // --- HLS setup that always includes credentials (cookies) ---
+  async function setupHlsAndPlay(src){
+    if (!src) return alert('Paste a .m3u8 URL');
 
-  mr = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 4_000_000 });
+    // Ensure the <video> participates in credentialed fetches when relevant
+    video.crossOrigin = 'use-credentials';
 
-  mr.ondataavailable = async (e) => {
-    if (!e.data || !e.data.size) return;
-    bytes += e.data.size;
-    if (writer) {
-      try { await writer.write(e.data); } catch (err) { log("Write error:", err.message || err); }
-    } else {
-      mrChunks.push(e.data);
-    }
-    setStatus(`recording… ${(bytes/1024/1024).toFixed(2)} MB`);
-  };
+    // Prefer hls.js so we can force credentials. We will only fall back to native on Safari if needed.
+    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 
-  mr.onstop = async () => {
-    try { if (writer) { await writer.close(); log("File closed — saved to disk."); } } catch(e){ log("Close error:", e.message || e); }
-    if (!writer) {
-      if (mrChunks.length) {
-        lastSavedWebMBlob = new Blob(mrChunks, { type: mime || "video/webm" });
-        downloadBlob(lastSavedWebMBlob, `recording-${new Date().toISOString().replace(/[:.]/g,"-")}.webm`);
-        setStatus("saved (WebM)");
-      } else {
-        setStatus("nothing recorded");
+    if (hls) { try { hls.destroy(); } catch{} hls = null; }
+    hls = new Hls({
+      enableWorker: true,
+      // XHR path (some loaders use XHR)
+      xhrSetup: (xhr, url) => {
+        xhr.withCredentials = true; // send cookies
+      },
+      // fetch path (modern loader)
+      fetchSetup: (ctx, init) => {
+        return Object.assign(init || {}, { credentials: 'include' });
       }
-    } else {
-      // If continuous save, we don’t have a Blob in memory
-      lastSavedWebMBlob = null;
-      setStatus("saved (file)");
-    }
-    convertBtn.disabled = !lastSavedWebMBlob; // only enable MP4 conversion if we have the blob
-  };
+    });
 
-  mr.start(1000); // collect chunks every second (finalizes metadata on stop)
-  recording = true; startBtn.disabled = true; stopBtn.disabled = false;
-  setStatus("recording…");
-  log("MediaRecorder started with", mime);
-}
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MEDIA_ATTACHED, () => { hls.loadSource(src); });
+    hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(()=>{}); log('Manifest parsed'); });
 
-function stopRecording() {
-  if (mr && recording && mr.state !== "inactive") { try { mr.stop(); } catch {} }
-  recording = false; startBtn.disabled = false; stopBtn.disabled = true;
-}
-
-function safeStopRecording() {
-  if (!recording) return;
-  try { mr.requestData && mr.requestData(); } catch {}
-  stopRecording();
-}
-
-// Save-on-leave (best-effort)
-const leaveHandler = () => { if (optAutoLeave.checked) safeStopRecording(); };
-window.addEventListener("pagehide", leaveHandler);
-window.addEventListener("beforeunload", leaveHandler);
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "hidden" && optAutoLeave.checked) safeStopRecording();
-});
-
-// UI wiring
-playBtn.addEventListener("click", async () => {
-  const src = urlInput.value.trim();
-  if (!src) return alert("Paste a .m3u8 URL");
-  autoStarted = false;
-  await setupHlsAndPlay(src);
-});
-video.addEventListener("playing", () => { if (optAutoStart.checked && !autoStarted) { autoStarted = true; startRecording(); } });
-video.addEventListener("ended", () => { if (optAutoEnd.checked) safeStopRecording(); });
-video.addEventListener("error", () => { if (optAutoEnd.checked) safeStopRecording(); });
-startBtn.addEventListener("click", () => startRecording());
-stopBtn.addEventListener("click", () => safeStopRecording());
-
-// --- MP4 conversion (client-side with ffmpeg.wasm) ---
-const { FFmpeg } = FFmpegWASM;
-let ffmpeg = null;
-async function ensureFfmpeg() {
-  if (ffmpeg) return ffmpeg;
-  ffmpeg = new FFmpeg();
-  ffxNote.textContent = "Loading FFmpeg (first time is big)…";
-  ffxProgress.hidden = false; ffxProgress.value = 5;
-  await ffmpeg.load({
-    // progress callback
-    progress: ({ ratio }) => { ffxProgress.hidden = false; ffxProgress.value = Math.round((ratio || 0) * 100); },
-    logger: ({ message }) => { if (message) ffxNote.textContent = message; }
-  });
-  ffxNote.textContent = "FFmpeg loaded.";
-  return ffmpeg;
-}
-
-convertBtn.addEventListener("click", async () => {
-  if (!lastSavedWebMBlob) { alert("No WebM in memory. Disable 'Continuous save' or use a server to convert."); return; }
-  try {
-    await ensureFfmpeg();
-    ffxNote.textContent = "Preparing input…"; ffxProgress.hidden = false; ffxProgress.value = 0;
-
-    const inBytes = new Uint8Array(await lastSavedWebMBlob.arrayBuffer());
-    await ffmpeg.writeFile('in.webm', inBytes);
-
-    // Re-encode VP8/Opus → H.264/AAC MP4 with faststart
-    ffxNote.textContent = "Converting to MP4… (this can take a while)";
-    await ffmpeg.exec([
-      '-i','in.webm',
-      '-c:v','libx264','-preset','veryfast','-pix_fmt','yuv420p','-b:v','3000k',
-      '-c:a','aac','-b:a','128k',
-      '-movflags','+faststart',
-      'out.mp4'
-    ]);
-
-    const mp4Data = await ffmpeg.readFile('out.mp4');
-    const blob = new Blob([mp4Data.buffer], { type: 'video/mp4' });
-    downloadBlob(blob, `recording-${new Date().toISOString().replace(/[:.]/g,'-')}.mp4`);
-    ffxNote.textContent = "Done! MP4 downloaded.";
-  } catch (e) {
-    console.error(e);
-    ffxNote.textContent = "Conversion failed (this build may lack codecs on some browsers).";
-  } finally {
-    ffxProgress.hidden = true;
+    hls.on(Hls.Events.ERROR, (_, data) => {
+      log('hls.js error:', data?.details || data?.type || 'unknown');
+      if (data?.fatal && isSafari) {
+        // Try native HLS on Safari (native will also send same-site cookies automatically)
+        try { hls.destroy(); } catch{}
+        hls = null;
+        log('Falling back to native HLS on Safari');
+        video.src = src;
+        video.play().catch(()=>{});
+      }
+    });
   }
-});
 
-// Enable convert button only when we’ve saved a WebM blob
-// (For continuous-save mode, we don’t hold the blob, so conversion isn’t available client-side.)
-</script>
+  playBtn.addEventListener('click', () => {
+    const src = urlInput.value.trim();
+    setupHlsAndPlay(src);
+  });
+  </script>
 </body>
 </html>
