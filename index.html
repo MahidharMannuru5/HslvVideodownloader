@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>HLS Player • Secure Playback</title>
+  <title>HLS Player • Proxy Support</title>
   <style>
     :root { color-scheme: light dark; }
     body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:0; padding:20px; }
@@ -20,7 +20,7 @@
 </head>
 <body>
   <div class="wrap">
-    <h1>HLS Player (Token/Headers Only)</h1>
+    <h1>HLS Player (with Proxy URL Support)</h1>
 
     <div class="row">
       <input id="m3u8" type="url" placeholder="Paste your .m3u8 URL" />
@@ -35,7 +35,7 @@
     </details>
   </div>
 
-  <!-- hls.js for playback -->
+  <!-- hls.js -->
   <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
 
   <script>
@@ -54,50 +54,48 @@
     console.log(...args);
   }
 
+  function proxiedUrl(originalUrl) {
+    const encoded = encodeURIComponent(originalUrl);
+    return `https://corsproxy.io/?${encoded}`; // you can replace with your own proxy endpoint
+  }
+
   async function setupHlsAndPlay(src) {
     if (!src) return alert('Paste a .m3u8 URL');
-    video.crossOrigin = 'anonymous'; // CORS headers must be set server-side
+    video.crossOrigin = 'anonymous';
 
-    const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
     if (hls) { try { hls.destroy(); } catch{} hls = null; }
-
     if (Hls.isSupported()) {
       hls = new Hls({
         debug: true,
         enableWorker: true,
         xhrSetup: (xhr, url) => {
-          xhr.withCredentials = false; // no cookies
+          xhr.withCredentials = false;
         },
         fetchSetup: (ctx, init) => {
           return Object.assign(init || {}, {
-            credentials: 'omit', // no cookies
-            headers: {
-              ...(init?.headers || {}),
-              // 'Authorization': 'Bearer YOUR_TOKEN_HERE', // optional
-            }
+            credentials: 'omit',
+            headers: { ...(init?.headers || {}) }
           });
         }
       });
 
       hls.attachMedia(video);
       hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-        hls.loadSource(src);
+        const finalUrl = proxiedUrl(src);
+        hls.loadSource(finalUrl);
       });
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         video.play().catch(() => {});
         log('Manifest parsed');
       });
+      hls.on(Hls.Events.LEVEL_LOADING, (_, data) => {
+        log(`Loading level: ${data?.level} from ${data?.url || 'unknown'}`);
+      });
       hls.on(Hls.Events.ERROR, (_, data) => {
         log('hls.js error:', data?.details || data?.type || 'unknown');
-        if (data?.fatal && isSafari) {
-          try { hls.destroy(); } catch{} hls = null;
-          video.src = src;
-          video.play().catch(() => {});
-          log('Falling back to native HLS');
-        }
       });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = src;
+      video.src = proxiedUrl(src);
       video.addEventListener('loadedmetadata', () => {
         video.play();
         log('Native HLS playback started');
